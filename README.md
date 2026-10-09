@@ -1,4 +1,4 @@
-# Pod Podcast Task TUI
+# CosmosFMPod
 
 A terminal app that downloads podcast audio from episode pages, optionally trims the beginning, and copies the resulting MP3 and title file to a mounted audio device. Downloads run concurrently; device transfers run one at a time, with progress and a queue shown in the terminal.
 
