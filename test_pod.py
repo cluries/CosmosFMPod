@@ -1,4 +1,4 @@
-"""隔离临时目录和模拟Device；不接触真实Device或既有输出。"""
+"""Uses temp dirs and a fake device; real devices and existing output are untouched."""
 import asyncio
 import functools
 import http.server
@@ -446,7 +446,7 @@ class PodTests(unittest.IsolatedAsyncioTestCase):
         app = FixtureApp(self.dest)
         with patch.object(pod.os.path, 'ismount', return_value=True):
             async with app.run_test(size=(120, 35)) as pilot:
-                # 同一次事件循环中连续提交，覆盖同毫秒命名。
+                # Submit within one event-loop pass to cover same-millisecond naming.
                 for n in range(1, 6):
                     app.on_input_submitted(pod.Input.Submitted(app.query_one(pod.CommandInput), f'https://example.com/{n}'))
                 await pilot.pause()
@@ -488,7 +488,7 @@ class PodTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(pod.os.path, 'ismount', side_effect=lambda _: mounted):
                 async with app.run_test(size=(100, 30)) as pilot:
                     await self.submit(app, pilot, f'{url}/page.html .5')
-                    self.assertEqual(len(app.tasks), 0)  # 原参数格式要求 0.5
+                    self.assertEqual(len(app.tasks), 0)  # '.5' is rejected; write '0.5'
                     await self.submit(app, pilot, f'{url}/page.html 0.5')
                     await self.submit(app, pilot, f'{url}/mp3.html nomove')
                     await asyncio.wait_for(app.prepare_queue.join(), 10)

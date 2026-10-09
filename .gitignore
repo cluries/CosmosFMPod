@@ -6,16 +6,16 @@ __pycache__/
 .coverage
 .venv/
 
-# 运行时生成的产物
+# Runtime artifacts
 dist/
 tmp/
 .move_history.jsonl
 transfer_history.jsonl
 
-# 备份的旧脚本
+# Old script backups
 bak/
 
-# 编辑器 / 系统文件
+# Editor / system files
 .vscode/
 .DS_Store
 

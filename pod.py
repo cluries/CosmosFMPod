@@ -71,7 +71,6 @@ def fmt_speed(sp):
     return "Unknown" if not sp else f"{sp / (1024 * 1024):.2f} MB/s"
 
 def parse_title(html):
-    """读取页面标题并去掉网站后缀。"""
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     if not m:
         return ""
@@ -82,7 +81,7 @@ def strip_site_suffix(title):
     return re.sub(r" *\| *小宇宙.*$", "", title)
 
 def parse_audio_url(html):
-    """解析 og:audio 的 content（属性顺序、引号、大小写均不限）。"""
+    """Extract og:audio content; attribute order, quoting and case vary."""
     patterns = [
         r'<meta\b[^>]*\bproperty\s*=\s*["\']og:audio["\'][^>]*\bcontent\s*=\s*["\']([^"\']+)["\']',
         r'<meta\b[^>]*\bcontent\s*=\s*["\']([^"\']+)["\'][^>]*\bproperty\s*=\s*["\']og:audio["\']',
@@ -211,7 +210,7 @@ def append_history(
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 def update_device_index(input_dir):
-    """静默：只写 LIST.md，不输出常规日志（目录缺失仍报错）。"""
+    """Silent: writes LIST.md only; still errors on a missing directory."""
     if not os.path.isdir(input_dir):
         err(f"Directory '{input_dir}' does not exist.")
         return
@@ -296,7 +295,7 @@ class PodTask:
 
 
 class CommandInput(Input):
-    """输入历史独立于任务表的键盘操作。"""
+    """Input with its own up/down history, independent of task-table keys."""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.history: list[str] = []
@@ -338,7 +337,7 @@ class TaskTable(DataTable):
             return
         for column, width in zip(self.ordered_columns, widths):
             column.width = width
-        # Textual 8.2 没有公开的列宽 setter；同时更新尺寸和渲染缓存。
+        # Textual 8.2 has no public column-width setter; also refresh size and render caches.
         self._require_update_dimensions = True
         self._update_count += 1
         self.check_idle()
@@ -589,7 +588,7 @@ class PodApp(App):
         except ValueError as exc:
             self.log_message(f"Input error: {exc}")
             return
-        # 毫秒命名；同一毫秒连续提交时递增 1ms，保持格式和唯一性。
+        # Millisecond names; bump 1ms on same-millisecond submissions to stay unique.
         stamp = datetime.now()
         stamp = stamp.replace(microsecond=stamp.microsecond // 1000 * 1000)
         if self.last_stamp is not None and stamp <= self.last_stamp:
@@ -609,7 +608,7 @@ class PodApp(App):
         self.set_state(task, "Waiting to process", url)
 
     async def command(self, *args):
-        """捕获子进程输出；取消时先终止并回收子进程。"""
+        """Capture subprocess output; terminate and reap the child on cancellation."""
         process = await asyncio.create_subprocess_exec(*map(str, args), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             stdout, stderr = await process.communicate()
