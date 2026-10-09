@@ -2,6 +2,7 @@
 import asyncio
 import functools
 import http.server
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -16,6 +17,36 @@ from textual.widgets import DataTable
 
 
 class ParseArgsTests(unittest.TestCase):
+    def test_config_defaults_and_saved_settings_from_another_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = root / 'config.json'
+            with patch.object(pod, 'CONFIG', config), patch.object(pod, 'BASE', root):
+                self.assertEqual(pod.load_config(), (None, 3))
+                config.write_text('{"dest": "device", "concurrency": 2}')
+                original = Path.cwd()
+                try:
+                    os.chdir(root.parent)
+                    self.assertEqual(pod.load_config(), (str((root / 'device').resolve()), 2))
+                finally:
+                    os.chdir(original)
+                config.write_text('{"dest": null, "concurrency": 3}')
+                self.assertEqual(pod.load_config(), (None, 3))
+
+    def test_invalid_config_is_rejected(self):
+        fixtures = ('{', '[]', '{"dest": ""}', '{"dest": 12}',
+                    '{"concurrency": 0}', '{"concurrency": -1}',
+                    '{"concurrency": 1.5}', '{"concurrency": true}',
+                    '{"concurrency": "2"}', '{"concurency": 2}')
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / 'config.json'
+            with patch.object(pod, 'CONFIG', config):
+                for value in fixtures:
+                    with self.subTest(value=value):
+                        config.write_text(value)
+                        with self.assertRaises(ValueError):
+                            pod.load_config()
+
     def test_default_transfer_and_explicit_nomove(self):
         url = 'https://example.com/episode'
         for arguments, trim, move in (
@@ -36,6 +67,77 @@ class ParseArgsTests(unittest.TestCase):
                     pod.parse_args(arguments)
 
 
+class HistoryTests(unittest.TestCase):
+    def test_invalid_records_do_not_replace_valid_totals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            history = Path(folder) / 'transfer_history.jsonl'
+            lines = [json.dumps({'cum_bytes': 100, 'cum_duration': 2}),
+                     '{broken', '42', '[]', '{"title":"incomplete"}',
+                     '{"cum_bytes":-1,"cum_duration":2}',
+                     '{"cum_bytes":100,"cum_duration":Infinity}',
+                     '{"cum_bytes":true,"cum_duration":2}',
+                     '{"cum_bytes":100,"cum_duration":"2"}',
+                     '{"cum_bytes":100,"cum_duration":NaN}']
+            history.write_text('\n'.join(lines))
+            with patch.object(pod, 'HISTORY', str(history)):
+                self.assertEqual(pod.read_last_cumulative(), (100.0, 2.0))
+
+    def test_speed_uses_last_five_valid_records_for_matching_device(self):
+        with tempfile.TemporaryDirectory() as folder:
+            history = Path(folder) / 'transfer_history.jsonl'
+            records = [{'cum_bytes': 80, 'cum_duration': 2},
+                       {'destination': '/device/a', 'size_bytes': 99999, 'duration': 1}]
+            for size in (100, 200, 300, 400, 500):
+                records += [{'destination': '/device/a', 'size_bytes': size, 'duration': 2},
+                            {'destination': '/device/b', 'size_bytes': 10000, 'duration': 1}]
+            records += [{'destination': '/device/a', 'size_bytes': -1, 'duration': 1},
+                        {'destination': '/device/a', 'size_bytes': 100, 'duration': 0}]
+            history.write_text('\n'.join(json.dumps(record) for record in records))
+            with patch.object(pod, 'HISTORY', str(history)):
+                self.assertEqual(pod.history_speed('/device/a'), 150)
+                self.assertEqual(pod.history_speed('/device/b'), 10000)
+                self.assertEqual(pod.history_speed('/device/c'), 40)
+                history.write_text(json.dumps(records[1]))
+                self.assertIsNone(pod.history_speed('/device/c'))
+
+    def test_append_after_truncated_record_keeps_new_record_readable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            history = Path(folder) / 'transfer_history.jsonl'
+            history.write_text('{"cum_bytes":100,"cum_duration":2}\n{"truncated":')
+            task = pod.PodTask(1, 'https://example.com', None, True, 'sample')
+            task.audio = Path(folder) / 'sample.mp3'
+            task.title_file = Path(folder) / 'sample.txt'
+            with patch.object(pod, 'HISTORY', str(history)):
+                pod.append_history('start', 'end', task, '/device', 50, 1, 150, 3)
+                self.assertEqual(pod.read_last_cumulative(), (150.0, 3.0))
+                self.assertEqual(len(list(pod.history_records())), 2)
+            self.assertEqual(json.loads(history.read_text().splitlines()[-1])['url'], task.url)
+
+    def test_legacy_history_is_renamed_without_changing_records(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            legacy = root / '.move_history.jsonl'
+            history = root / 'transfer_history.jsonl'
+            original = '{"cum_bytes": 4096, "cum_duration": 2.5, "title": "旧记录"}\n'
+            legacy.write_text(original, encoding='utf-8')
+            with patch.object(pod, 'HISTORY', str(history)):
+                self.assertEqual(pod.read_last_cumulative(), (4096.0, 2.5))
+            self.assertFalse(legacy.exists())
+            self.assertEqual(history.read_text(encoding='utf-8'), original)
+
+    def test_existing_new_history_takes_precedence_over_legacy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            legacy = root / '.move_history.jsonl'
+            history = root / 'transfer_history.jsonl'
+            legacy.write_text('{"cum_bytes": 10, "cum_duration": 1}\n')
+            history.write_text('{"cum_bytes": 20, "cum_duration": 2}\n')
+            with patch.object(pod, 'HISTORY', str(history)):
+                self.assertEqual(pod.read_last_cumulative(), (20.0, 2.0))
+            self.assertTrue(legacy.exists())
+            self.assertEqual(json.loads(legacy.read_text())['cum_bytes'], 10)
+
+
 class PodTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
@@ -45,7 +147,7 @@ class PodTests(unittest.IsolatedAsyncioTestCase):
         self.dist = self.root / 'dist'
         self.patches = [patch.object(pod, 'DIST', str(self.dist)),
                         patch.object(pod, 'TMP', str(self.root / 'tmp')),
-                        patch.object(pod, 'HISTORY', str(self.root / 'history.jsonl'))]
+                        patch.object(pod, 'HISTORY', str(self.root / 'transfer_history.jsonl'))]
         for item in self.patches:
             item.start()
 
@@ -62,6 +164,164 @@ class PodTests(unittest.IsolatedAsyncioTestCase):
     async def wait_all(self, app):
         await asyncio.wait_for(app.prepare_queue.join(), 10)
         await asyncio.wait_for(app.device_queue.join(), 10)
+
+    async def test_network_progress_retries_and_permanent_http_failure(self):
+        counts = {}
+        payload = b'a' * (1024 * 1024)
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_GET(self):
+                counts[self.path] = counts.get(self.path, 0) + 1
+                if self.path == '/missing':
+                    self.send_error(404)
+                    return
+                if self.path == '/retry' and counts[self.path] == 1:
+                    self.send_error(503)
+                    return
+                if self.path == '/page-retry':
+                    if counts[self.path] == 1:
+                        self.send_error(503)
+                    else:
+                        page = b'<title>Fixture page</title>'
+                        self.send_response(200)
+                        self.send_header('Content-Length', str(len(page)))
+                        self.end_headers()
+                        self.wfile.write(page)
+                    return
+                if self.path == '/always-fail':
+                    self.send_error(503)
+                    return
+                self.send_response(200)
+                if self.path != '/unknown':
+                    self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                try:
+                    if self.path == '/interrupted' and counts[self.path] == 1:
+                        self.wfile.write(payload[:65536])
+                        self.wfile.flush()
+                        self.close_connection = True
+                        return
+                    for start in range(0, len(payload), 65536):
+                        self.wfile.write(payload[start:start + 65536])
+                        self.wfile.flush()
+                        time.sleep(.05)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f'http://127.0.0.1:{server.server_port}'
+        Path(pod.TMP).mkdir()
+        app = pod.PodApp()
+        try:
+            async with app.run_test(size=(140, 35)) as pilot:
+                # Insert a normal task row, then exercise the real curl request directly.
+                with patch.object(app, 'prepare', return_value=None):
+                    await self.submit(app, pilot, f'{url}/known nomove')
+                    await self.wait_all(app)
+                task = app.tasks[0]
+                output = self.root / 'download'
+                for route, total in (('/known', len(payload)), ('/unknown', None)):
+                    request = asyncio.create_task(app.network_request(task, url + route, output))
+                    try:
+                        async def wait_progress():
+                            while not 0 < task.download_bytes < len(payload) or task.state != 'Downloading':
+                                await asyncio.sleep(.02)
+                        await asyncio.wait_for(wait_progress(), 5)
+                        self.assertEqual(task.download_total, total)
+                        app.refresh_status()
+                        detail = str(app.query_one('#task-detail').render())
+                        self.assertIn('Download:', detail)
+                        self.assertIn('ETA' if total else 'Total unknown', detail)
+                        await request
+                        self.assertEqual(output.read_bytes(), payload)
+                    finally:
+                        if not request.done():
+                            request.cancel()
+                        await asyncio.gather(request, return_exceptions=True)
+                        task.download_bytes = 0
+                await app.network_request(task, url + '/retry', output)
+                self.assertEqual(counts['/retry'], 2)
+                self.assertEqual(output.read_bytes(), payload)
+                self.assertEqual(task.download_attempt, 2)
+                await app.network_request(task, url + '/interrupted', output)
+                self.assertEqual(counts['/interrupted'], 2)
+                self.assertEqual(output.read_bytes(), payload)
+                with self.assertRaises(pod.CommandError):
+                    await app.network_request(task, url + '/missing', output)
+                self.assertEqual(counts['/missing'], 1)
+                with self.assertRaises(pod.CommandError):
+                    await app.network_request(task, url + '/always-fail', output)
+                self.assertEqual(counts['/always-fail'], 3)
+                page = await app.network_request(task, url + '/page-retry')
+                self.assertEqual(counts['/page-retry'], 2)
+                self.assertEqual(page, '<title>Fixture page</title>')
+                await app.action_stop()
+        finally:
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+            thread.join()
+
+    async def test_cancel_network_request_terminates_child_and_cleans_headers(self):
+        Path(pod.TMP).mkdir()
+        app = pod.PodApp()
+        task = pod.PodTask(1, 'https://example.com', None, False, 'cancel')
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        async def pending_command(*args):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        with patch.object(app, 'set_state'), patch.object(app, 'command', side_effect=pending_command):
+            request = asyncio.create_task(app.network_request(task, task.url, self.root / 'download'))
+            await asyncio.wait_for(started.wait(), 2)
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(list(Path(pod.TMP).iterdir()))
+
+    async def test_cancel_during_retry_wait_does_not_start_another_attempt(self):
+        Path(pod.TMP).mkdir()
+        app = pod.PodApp()
+        task = pod.PodTask(1, 'https://example.com', None, False, 'cancel')
+        retrying = asyncio.Event()
+        details = []
+        def state_changed(task, state, detail):
+            details.append(detail)
+            if 'Retry 2/3' in detail:
+                retrying.set()
+        failure = pod.CommandError('curl', 28, '\n000', 'timeout')
+        with patch.object(app, 'set_state', side_effect=state_changed), patch.object(app, 'command', side_effect=failure) as command:
+            request = asyncio.create_task(app.network_request(task, task.url))
+            await asyncio.wait_for(retrying.wait(), 2)
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+            self.assertEqual(command.call_count, 1)
+        self.assertTrue(any('Network error' in detail for detail in details))
+        self.assertFalse(list(Path(pod.TMP).iterdir()))
+
+    async def test_no_device_rejects_transfer_but_allows_local_task(self):
+        class LocalApp(pod.PodApp):
+            async def prepare(self, task):
+                self.dist.mkdir(exist_ok=True)
+                task.audio = self.dist / f'{task.stem}.mp3'
+                task.audio.write_bytes(b'fixture')
+        app = LocalApp()
+        app.dist = self.dist
+        async with app.run_test() as pilot:
+            await self.submit(app, pilot, 'https://example.com/episode')
+            self.assertEqual(app.tasks, [])
+            self.assertIn('not configured', str(app.query_one('#summary').render()))
+            await self.submit(app, pilot, 'https://example.com/episode nomove')
+            await self.wait_all(app)
+            self.assertEqual(app.tasks[0].state, 'Done')
+            self.assertTrue(app.tasks[0].audio.exists())
+            await app.action_stop()
 
     async def test_responsive_table_and_fixed_device_queue(self):
         app = pod.PodApp(self.dest)
@@ -287,6 +547,40 @@ class PodTests(unittest.IsolatedAsyncioTestCase):
                 app.copy_task(task)
         self.assertFalse(list(self.dest.iterdir()))
         self.assertTrue(task.audio.exists())
+        self.assertFalse(Path(pod.HISTORY).exists())
+
+    async def test_successful_copy_records_task_metadata_and_preserves_totals(self):
+        self.dist.mkdir()
+        legacy = self.root / '.move_history.jsonl'
+        legacy.write_text('{"cum_bytes": 1000, "cum_duration": 2}\n')
+        app = pod.PodApp(self.dest)
+        for number, trim in enumerate((None, 0.0, 0.5), 1):
+            task = pod.PodTask(number, f'https://example.com/episode/{number}?source=test',
+                               trim, True, f'sample{number}', title='播客标题')
+            task.audio = self.dist / f'{task.stem}.mp3'
+            task.title_file = self.dist / f'{task.stem}.txt'
+            task.audio.write_bytes(b'a' * 100)
+            task.title_file.write_text(task.title, encoding='utf-8')
+            with patch.object(pod.os.path, 'ismount', return_value=True):
+                app.copy_task(task)
+            records = [json.loads(line) for line in Path(pod.HISTORY).read_text(encoding='utf-8').splitlines()]
+            self.assertEqual(len(records), number + 1)
+            record = records[-1]
+            self.assertEqual(record['schema_version'], 2)
+            self.assertEqual(record['url'], task.url)
+            self.assertEqual(record['trim_seconds'], trim)
+            self.assertEqual(record['title'], task.title)
+            self.assertEqual(record['filename'], task.audio.name)
+            self.assertEqual(record['title_filename'], task.title_file.name)
+            self.assertEqual(record['audio_path'], str(task.audio.resolve()))
+            self.assertEqual(record['title_path'], str(task.title_file.resolve()))
+            self.assertEqual(record['destination'], str(self.dest.resolve()))
+            self.assertEqual(record['size_bytes'], 100)
+            self.assertEqual(record['cum_bytes'], 1000 + number * 100)
+            self.assertGreaterEqual(record['cum_duration'], 2)
+            self.assertEqual((self.dest / task.audio.name).read_bytes(), task.audio.read_bytes())
+        self.assertFalse(legacy.exists())
+        self.assertEqual(pod.read_last_cumulative(), (record['cum_bytes'], record['cum_duration']))
 
     async def test_ctrl_c_waits_for_active_copy_cleanup(self):
         class ReadyApp(pod.PodApp):

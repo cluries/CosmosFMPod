@@ -10,6 +10,7 @@ __pycache__/
 dist/
 tmp/
 .move_history.jsonl
+transfer_history.jsonl
 
 # 备份的旧脚本
 bak/
@@ -17,3 +18,6 @@ bak/
 # 编辑器 / 系统文件
 .vscode/
 .DS_Store
+
+# Local configuration
+/config.json

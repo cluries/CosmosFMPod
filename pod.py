@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Podcast task TUI. Start without arguments; enter URL [trim seconds] [nomove].
+"""Podcast task TUI. Settings are read from config.json beside this script.
 
-Tasks copy their mp3/txt to the device by default and retain local files.
-nomove keeps results local only. /exit finishes tasks; Ctrl+C stops them.
-Requires textual, curl, ffmpeg and ffprobe. Default concurrency: 3.
+Enter URL [trim seconds] [nomove]. Transfer tasks require a device setting
+and retain local files. nomove keeps results local only.
+/exit finishes tasks; Ctrl+C stops them. Requires textual, curl, ffmpeg,
+ffprobe and cp. Default concurrency: 3.
 """
+import argparse
 import asyncio
 import html as html_module
 import json
@@ -18,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from glob import glob
@@ -32,13 +35,23 @@ from textual.containers import Vertical, VerticalScroll
 from textual.widgets import DataTable, Input, RichLog, Static
 
 BASE = Path(__file__).resolve().parent
-DEST = "/Volumes/ZhuAudio X8"
+CONFIG = BASE / "config.json"
 DIST = str(BASE / "dist")
 TMP = str(BASE / "tmp")
-HISTORY = str(BASE / ".move_history.jsonl")
+HISTORY = str(BASE / "transfer_history.jsonl")
 MAX_CONCURRENT = 3
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 NUM_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+NETWORK_ATTEMPTS = 3
+RETRY_CURL_CODES = {5, 6, 7, 18, 28, 52, 55, 56}
+RETRY_HTTP_CODES = {408, 429, 500, 502, 503, 504}
+
+
+class CommandError(RuntimeError):
+    def __init__(self, program, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        super().__init__(f"{program} failed ({returncode}): {stderr.strip()[-1500:]}")
 
 
 def err(message):
@@ -86,25 +99,78 @@ def guess_ext(url):
         ext = "mp3"
     return ext
 
-def read_last_cumulative():
-    if not os.path.exists(HISTORY):
-        return 0.0, 0.0
-    last = None
-    with open(HISTORY, encoding="utf-8") as f:
+def history_path():
+    path = Path(HISTORY)
+    legacy = path.with_name(".move_history.jsonl")
+    if not path.exists() and legacy.is_file():
+        legacy.rename(path)
+    return path
+
+def history_records():
+    path = history_path()
+    if not path.exists():
+        return
+    with path.open(encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                last = json.loads(line)
+                record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-    if not last:
-        return 0.0, 0.0
+            if isinstance(record, dict):
+                yield record
+
+def valid_history_number(value):
+    if type(value) not in (int, float):
+        return False
     try:
-        return float(last["cum_bytes"]), float(last["cum_duration"])
-    except (KeyError, TypeError, ValueError):
-        return 0.0, 0.0
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+def read_last_cumulative():
+    totals = (0.0, 0.0)
+    for record in history_records():
+        values = (record.get("cum_bytes"), record.get("cum_duration"))
+        if all(valid_history_number(value) for value in values):
+            totals = tuple(float(value) for value in values)
+    return totals
+
+def history_speed(destination):
+    recent = deque(maxlen=5)
+    legacy = None
+    for record in history_records():
+        if record.get("destination") == str(destination):
+            size, duration = record.get("size_bytes"), record.get("duration")
+            if all(valid_history_number(value) and value > 0 for value in (size, duration)):
+                recent.append((float(size), float(duration)))
+        elif record.get("destination") is None:
+            size, duration = record.get("cum_bytes"), record.get("cum_duration")
+            if all(valid_history_number(value) for value in (size, duration)):
+                legacy = avg_speed(float(size), float(duration))
+    if recent:
+        return avg_speed(sum(size for size, _ in recent), sum(duration for _, duration in recent))
+    return legacy
+
+def download_total(headers):
+    if not headers.exists():
+        return None
+    blocks = headers.read_text(encoding="utf-8", errors="replace").split("\n\n")
+    for block in reversed(blocks):
+        lines = block.splitlines()
+        if not lines or not lines[0].startswith("HTTP/"):
+            continue
+        status = lines[0].split()
+        if len(status) < 2 or not status[1].isdigit() or not 200 <= int(status[1]) < 300:
+            return None
+        fields = dict(line.lower().split(":", 1) for line in lines[1:] if ":" in line)
+        if "transfer-encoding" in fields:
+            return None
+        length = fields.get("content-length", "").strip()
+        return int(length) if length.isdigit() and int(length) > 0 else None
+    return None
 
 def avg_speed(cum_bytes, cum_duration):
     return cum_bytes / cum_duration if cum_duration > 0 else None
@@ -113,22 +179,38 @@ def estimate_seconds(size_bytes, speed):
     return size_bytes / speed if speed and speed > 0 else None
 
 def append_history(
-    start_iso, end_iso, filename, size, duration, cum_bytes, cum_duration, title
+    start_iso, end_iso, task, destination, size, duration, cum_bytes, cum_duration
 ):
     rec = {
+        "schema_version": 2,
         "start_time": start_iso,
         "end_time": end_iso,
-        "filename": filename,
+        "filename": task.audio.name,
+        "title_filename": task.title_file.name,
+        "url": task.url,
+        "trim_seconds": task.trim,
+        "destination": str(destination),
+        "audio_path": str(task.audio.resolve()),
+        "title_path": str(task.title_file.resolve()),
         "size_bytes": size,
         "duration": round(duration, 6),
         "cum_bytes": int(cum_bytes),
         "cum_duration": round(cum_duration, 6),
-        "title": title,
+        "title": task.title,
     }
-    with open(HISTORY, "a", encoding="utf-8") as f:
+    path = history_path()
+    # Keep a truncated final record separate from the next successful transfer.
+    needs_newline = False
+    if path.exists() and path.stat().st_size:
+        with path.open("rb") as f:
+            f.seek(-1, os.SEEK_END)
+            needs_newline = f.read(1) != b"\n"
+    with path.open("a", encoding="utf-8") as f:
+        if needs_newline:
+            f.write("\n")
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-def step_named(input_dir):
+def update_device_index(input_dir):
     """静默：只写 LIST.md，不输出常规日志（目录缺失仍报错）。"""
     if not os.path.isdir(input_dir):
         err(f"Directory '{input_dir}' does not exist.")
@@ -145,7 +227,7 @@ def step_named(input_dir):
                 content = fh.read()
         except OSError:
             content = ""
-        # 复刻 named.sh：每行取 | 的首字段
+        # Each title line contributes the field before its first pipe.
         first_fields = [line.split("|")[0] for line in content.splitlines()]
         field = "\n".join(first_fields)
         buf.append(f"{n} => {field}\n\n")
@@ -207,6 +289,10 @@ class PodTask:
     copy_bytes: int = 0
     copy_total: int = 0
     device_order: int = 0
+    download_started: float = 0
+    download_bytes: int = 0
+    download_total: int | None = None
+    download_attempt: int = 0
 
 
 class CommandInput(Input):
@@ -287,9 +373,9 @@ class PodApp(App):
     BINDINGS = [Binding("ctrl+c", "stop", "Stop now", priority=True),
                 Binding("ctrl+q", "stop", "Stop now", show=False, priority=True)]
 
-    def __init__(self, dest=DEST, concurrency=MAX_CONCURRENT):
+    def __init__(self, dest=None, concurrency=MAX_CONCURRENT):
         super().__init__()
-        self.dest = str(dest)
+        self.dest = str(Path(dest).expanduser().resolve()) if dest else None
         self.concurrency = concurrency
         self.tasks: list[PodTask] = []
         self.prepare_queue = asyncio.Queue()
@@ -301,6 +387,9 @@ class PodApp(App):
         self.last_stamp: datetime | None = None
         self.columns = ()
         self.device_sequence = 0
+
+    def device_mounted(self):
+        return self.dest is not None and os.path.ismount(self.dest)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="device-transfer"):
@@ -328,7 +417,7 @@ class PodApp(App):
         self.runners = [asyncio.create_task(self.prepare_worker()) for _ in range(self.concurrency)]
         self.runners.append(asyncio.create_task(self.device_worker()))
         self.set_interval(0.3, self.refresh_status)
-        self.log_message(f"Concurrent processing: {self.concurrency}; device: {self.dest}")
+        self.log_message(f"Concurrent processing: {self.concurrency}; device: {self.dest or 'not configured (use nomove)'}")
         self.refresh_status()
 
     def log_message(self, message):
@@ -339,12 +428,26 @@ class PodApp(App):
         self.log_message(f"#{task.number} {state}" + (f": {detail}" if detail else ""))
         self.refresh_status()
 
+    def download_detail(self, task):
+        speed = task.download_bytes / max(.001, time.monotonic() - task.download_started)
+        text = f"Attempt {task.download_attempt}/{NETWORK_ATTEMPTS} · {fmt_size(task.download_bytes)}"
+        if task.download_total:
+            remaining = max(0, task.download_total - task.download_bytes)
+            text += (f" / {fmt_size(task.download_total)}"
+                     f" · {min(1, task.download_bytes / task.download_total):.0%}"
+                     f" · {fmt_speed(speed)} · ETA {fmt_dur(estimate_seconds(remaining, speed))}")
+        else:
+            text += f" · {fmt_speed(speed)} · Total unknown"
+        return text
+
     def refresh_status(self):
         table = self.query_one(TaskTable)
         table.fit_columns()
         for task in self.tasks:
             elapsed = (task.finished or time.monotonic()) - task.started
             detail = task.detail
+            if task.state == "Downloading" and not task.detail:
+                detail = self.download_detail(task)
             if task.state == "Copying" and task.copy_total:
                 duration = time.monotonic() - task.copy_started
                 speed = task.copy_bytes / duration if duration > 0 else None
@@ -371,7 +474,7 @@ class PodApp(App):
         device = sum(t.state in ("Waiting to copy", "Waiting for device") for t in self.tasks)
         complete = sum(t.state == "Done" for t in self.tasks)
         failed = sum(t.state == "Failed" for t in self.tasks)
-        mounted = "online" if os.path.ismount(self.dest) else "offline"
+        mounted = "not configured" if self.dest is None else "online" if self.device_mounted() else "offline"
         prefix = "Stopping" if self.stopping else "Exiting" if self.closing else "Running"
         summary = Text(no_wrap=True, overflow="ellipsis")
         summary.append(f"{prefix}  ", style="bold cyan")
@@ -398,6 +501,8 @@ class PodApp(App):
         text.append(f"\nStatus: {task.state}", style="red" if task.state == "Failed" else "cyan")
         text.append(f"  |  Trim: {trim}  |  Elapsed: {elapsed:.1f}s  |  Device: {mode}")
         text.append(f"\nURL: {task.url}\nOutput name: {task.stem}")
+        if task.state == "Downloading" and not task.detail:
+            text.append(f"\nDownload: {self.download_detail(task)}")
         if task.audio:
             text.append(f"\nAudio: {task.audio}")
         if task.title_file:
@@ -447,7 +552,8 @@ class PodApp(App):
             else:
                 text.append(f"\n{self.dest}" if active.state == "Waiting for device" else f"\n{active.detail}", style="dim")
         else:
-            text.append("Device idle" if os.path.ismount(self.dest) else "Device disconnected", style="dim")
+            text.append("Device not configured · Use nomove" if self.dest is None else
+                        "Device idle" if self.device_mounted() else "Device disconnected", style="dim")
             text.append(f" · Queued {len(queued)} · Preparing {preparing}")
         text.no_wrap = True
         text.overflow = "ellipsis"
@@ -478,6 +584,8 @@ class PodApp(App):
             return
         try:
             url, trim, move = parse_args(shlex.split(command))
+            if move and self.dest is None:
+                raise ValueError("No device configured. Add nomove for local output, or set dest in config.json and restart.")
         except ValueError as exc:
             self.log_message(f"Input error: {exc}")
             return
@@ -489,7 +597,8 @@ class PodApp(App):
         while True:
             stem = stamp.strftime("%m%d_%H%M%S_%f")[:-3]
             if not any((Path(folder) / f"{stem}{suffix}").exists()
-                       for folder in (DIST, self.dest) for suffix in (".mp3", ".txt")):
+                       for folder in (DIST, self.dest) if folder is not None
+                       for suffix in (".mp3", ".txt")):
                 break
             stamp += timedelta(milliseconds=1)
         self.last_stamp = stamp
@@ -517,9 +626,57 @@ class PodApp(App):
                     await process.wait()
             raise
         if process.returncode:
-            message = stderr.decode("utf-8", "replace").strip()[-1500:]
-            raise RuntimeError(f"{args[0]} failed ({process.returncode}): {message}")
+            raise CommandError(args[0], process.returncode, stdout.decode("utf-8", "replace"),
+                               stderr.decode("utf-8", "replace"))
         return stdout.decode("utf-8", "replace").strip()
+
+    async def network_request(self, task, url, output=None):
+        """Retry temporary network failures; observe curl output without blocking the UI."""
+        with tempfile.TemporaryDirectory(prefix="request_", dir=TMP) as folder:
+            headers = Path(folder) / "headers"
+            for attempt in range(1, NETWORK_ATTEMPTS + 1):
+                headers.unlink(missing_ok=True)
+                if output is not None:
+                    output.unlink(missing_ok=True)
+                    task.download_started = time.monotonic()
+                    task.download_bytes = 0
+                    task.download_total = None
+                    task.download_attempt = attempt
+                state = "Downloading" if output is not None else "Fetching page"
+                self.set_state(task, state, "" if output is not None else f"Attempt {attempt}/{NETWORK_ATTEMPTS}")
+                args = ["curl", "-sS", "-L", "--fail", "--connect-timeout", "30",
+                        "-D", headers, "--write-out", "\n%{http_code}", "-A", UA]
+                if output is None:
+                    args += ["--max-time", "120"]
+                else:
+                    args += ["--speed-limit", "1", "--speed-time", "60", "-o", output]
+                request = asyncio.create_task(self.command(*args, url))
+                try:
+                    if output is not None:
+                        while not request.done():
+                            task.download_bytes = output.stat().st_size if output.exists() else 0
+                            task.download_total = download_total(headers)
+                            await asyncio.wait({request}, timeout=.2)
+                    result = await request
+                    if output is not None:
+                        task.download_bytes = output.stat().st_size
+                        task.download_total = download_total(headers)
+                    # --write-out appends the response status after the page body.
+                    return result.rsplit("\n", 1)[0]
+                except CommandError as exc:
+                    status = exc.stdout.strip().rsplit("\n", 1)[-1]
+                    retryable = (exc.returncode in RETRY_CURL_CODES or
+                                 exc.returncode == 22 and status.isdigit() and int(status) in RETRY_HTTP_CODES)
+                    if not retryable or attempt == NETWORK_ATTEMPTS:
+                        raise
+                    delay = 2 ** (attempt - 1)
+                    reason = f"HTTP {status}" if exc.returncode == 22 else f"Network error (curl {exc.returncode})"
+                    self.set_state(task, state, f"{reason} · Retry {attempt + 1}/{NETWORK_ATTEMPTS} in {delay}s")
+                    await asyncio.sleep(delay)
+                finally:
+                    if not request.done():
+                        request.cancel()
+                    await asyncio.gather(request, return_exceptions=True)
 
     async def prepare_worker(self):
         while True:
@@ -543,13 +700,12 @@ class PodApp(App):
                 self.prepare_queue.task_done()
 
     async def prepare(self, task):
-        missing = [name for name in ("curl", "ffmpeg", "ffprobe") if not shutil.which(name)]
+        missing = [name for name in ("curl", "ffmpeg", "ffprobe", "cp") if not shutil.which(name)]
         if missing:
             raise RuntimeError("Missing commands: " + ", ".join(missing))
         Path(DIST).mkdir(parents=True, exist_ok=True)
         Path(TMP).mkdir(parents=True, exist_ok=True)
-        self.set_state(task, "Fetching page")
-        page = await self.command("curl", "-sS", "-L", "--fail", "--connect-timeout", "30", "--max-time", "120", "-A", UA, task.url)
+        page = await self.network_request(task, task.url)
         task.title = html_module.unescape(parse_title(page))
         audio_url = parse_audio_url(page)
         if not audio_url:
@@ -559,8 +715,7 @@ class PodApp(App):
         with tempfile.TemporaryDirectory(prefix="temp_pod_", dir=TMP) as folder:
             original = Path(folder) / f"original.{ext}"
             converted = Path(folder) / "converted.mp3"
-            self.set_state(task, "Downloading")
-            await self.command("curl", "-sS", "-L", "--fail", "--connect-timeout", "30", "--speed-limit", "1", "--speed-time", "60", "-A", UA, "-o", original, audio_url)
+            await self.network_request(task, audio_url, original)
             self.set_state(task, "Converting", f"Downloaded {fmt_size(original.stat().st_size)}")
             copy_original = False
             if ext == "mp3" and task.trim is None:
@@ -588,12 +743,12 @@ class PodApp(App):
         while True:
             task = await self.device_queue.get()
             try:
-                while not os.path.ismount(self.dest):
+                while not self.device_mounted():
                     if task.state != "Waiting for device":
                         self.set_state(task, "Waiting for device", self.dest)
                     await asyncio.sleep(1)
-                cb, cd = read_last_cumulative()
-                estimate = estimate_seconds(task.audio.stat().st_size, avg_speed(cb, cd))
+                speed = await asyncio.to_thread(history_speed, self.dest)
+                estimate = estimate_seconds(task.audio.stat().st_size, speed)
                 self.set_state(task, "Copying", f"Estimated from history: {fmt_dur(estimate)}")
                 # One consumer serializes device copies, history and LIST.md updates.
                 await asyncio.to_thread(self.copy_task, task)
@@ -645,10 +800,10 @@ class PodApp(App):
                     temporary.unlink(missing_ok=True)
         duration = time.monotonic() - task.copy_started
         cb, cd = read_last_cumulative()
-        append_history(start_iso, now_iso(), task.audio.name, task.copy_total, duration, cb + task.copy_total, cd + duration, task.title)
+        append_history(start_iso, now_iso(), task, destination, task.copy_total, duration, cb + task.copy_total, cd + duration)
         if self.stop_event.is_set():
             raise InterruptedError("Copy stopped")
-        step_named(self.dest)
+        update_device_index(self.dest)
 
     async def action_stop(self):
         if self.stopping:
@@ -676,14 +831,43 @@ class PodApp(App):
         self.exit()
 
 
+def load_config():
+    try:
+        with CONFIG.open(encoding="utf-8") as file:
+            config = json.load(file)
+    except FileNotFoundError:
+        config = {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read {CONFIG.name}: {exc}") from None
+    if not isinstance(config, dict):
+        raise ValueError("config.json must contain a JSON object")
+    unknown = config.keys() - {"dest", "concurrency"}
+    if unknown:
+        raise ValueError("Unknown config.json settings: " + ", ".join(sorted(unknown)))
+    dest = config.get("dest")
+    if dest is not None:
+        if not isinstance(dest, str) or not dest.strip():
+            raise ValueError("config.json dest must be a non-empty path string or null")
+        path = Path(dest).expanduser()
+        dest = str((path if path.is_absolute() else BASE / path).resolve())
+    concurrency = config.get("concurrency", MAX_CONCURRENT)
+    if type(concurrency) is not int or concurrency < 1:
+        raise ValueError("config.json concurrency must be a positive integer")
+    return dest, concurrency
+
+
 def main():
-    if len(sys.argv) > 1:
-        print("Start the TUI without arguments: python3 pod.py; then enter URL [trim seconds] [nomove].", file=sys.stderr)
+    parser = argparse.ArgumentParser(description="Podcast task TUI. Configure dest and concurrency in config.json beside pod.py.")
+    parser.parse_args()
+    try:
+        dest, concurrency = load_config()
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("The TUI requires an interactive terminal. Run pod.py directly in a terminal.", file=sys.stderr)
         return 1
-    PodApp().run()
+    PodApp(dest, concurrency).run()
     return 0
 
 

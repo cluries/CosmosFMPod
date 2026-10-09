@@ -1,45 +1,145 @@
-# Pod 播客任务 TUI
+# Pod Podcast Task TUI
 
-使用 Python 3.10 或更新版本，并安装 `curl`、`ffmpeg`（包含 `ffprobe`）。
+A terminal app that downloads podcast audio from episode pages, optionally trims the beginning, and copies the resulting MP3 and title file to a mounted audio device. Downloads run concurrently; device transfers run one at a time, with progress and a queue shown in the terminal.
+
+## Requirements and support
+
+- Python 3.10 or newer.
+- `curl`, `ffmpeg` (with `ffprobe` and the `libmp3lame` encoder), and the Unix `cp` command on your PATH.
+- An interactive terminal; redirected input/output is not supported.
+
+Development and local validation have been performed on macOS. Linux may work with the same dependencies and an appropriate device mount point, but has not been verified. Windows is not currently supported.
+
+The downloader reads an `og:audio` meta tag from the page HTML. Xiaoyuzhou (小宇宙) episode pages are the intended use case; their title suffix is removed. Other pages may work if they expose an accessible audio URL in this tag. RSS feeds, direct audio URLs, login-required pages, and pages that expose audio only through JavaScript are not supported. Current live website compatibility has not been verified by the automated tests.
+
+## Quick start
+
+On macOS, install the system dependencies using Homebrew if needed:
 
 ```sh
-uv pip install --python .venv/bin/python -r requirements.txt
-./.venv/bin/python pod.py
+brew install curl ffmpeg
 ```
 
-如果使用自己的 Python 环境，先执行 `python -m pip install -r requirements.txt`，再执行 `python pod.py`。
+From the cloned repository directory, create a virtual environment and install the Python dependencies:
 
-底部输入一条命令，按 Enter 提交一个任务：
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python pod.py
+```
+
+Type a podcast episode page URL followed by `nomove` into the bottom input box, then press Enter:
+
+```text
+https://www.xiaoyuzhoufm.com/episode/<episode-id> nomove
+```
+
+Replace `<episode-id>` with the ID from an actual episode page. `nomove` keeps the output local. Files are saved in `dist/` beside `pod.py`.
+
+To copy results to a device, configure its mount point once as described below, then submit the episode URL without `nomove`. A configured destination must be a mounted filesystem, not just an existing folder. If it is disconnected, transfer tasks wait while other downloads continue. Without a configured destination, transfer submissions are rejected with a configuration hint; local `nomove` tasks still work.
+
+## Configuration
+
+Settings are read from `config.json` in the project root, beside `pod.py`, regardless of the directory you launch from. Copy the example once and edit it. If `config.json` already exists, edit that file directly; the command below preserves existing settings:
+
+```sh
+cp -n config.example.json config.json
+```
+
+For example:
+
+```json
+{
+  "dest": "/Volumes/Your Audio Player",
+  "concurrency": 3
+}
+```
+
+- `dest`: the device mount point, or `null` for local `nomove` tasks only. Absolute paths and `~` are supported; relative paths are resolved against the project root.
+- `concurrency`: a positive JSON integer, defaulting to 3.
+
+If the file is absent, the defaults are no device and concurrency 3. Missing settings also use these defaults. Invalid JSON, unknown settings, or invalid values produce a configuration error before the TUI starts. Changes take effect on the next launch.
+
+After saving the file, start normally each time:
+
+```sh
+python pod.py
+```
+
+Your local `config.json` is excluded from Git so your device path stays local. `config.example.json` is included in the repository. Configuration does not use command-line settings or environment variables.
+
+`dist/`, `tmp/`, and `transfer_history.jsonl` are created beside the script, regardless of the working directory. The script directory must be writable. These files are excluded from Git.
+
+Transfer history uses one JSON object per line and records each successfully copied MP3/TXT pair. New records include `schema_version` (2), the original episode page `url`, `trim_seconds` (`null` when omitted, or a number including explicit `0`), `title`, MP3 `filename`, `title_filename`, local `audio_path` and `title_path`, device `destination`, transfer `start_time` and `end_time`, audio `size_bytes`, transfer `duration` in seconds, and cumulative `cum_bytes` and `cum_duration` for speed estimates. Local-only `nomove` tasks and failed copies are not recorded. History is written before the device's `LIST.md` is regenerated, so a later index-update failure can leave a history record for a task shown as failed.
+
+Malformed JSON, non-object records, missing statistical fields, and invalid statistical values are skipped when reading history. Statistics must be finite, non-negative JSON numbers; booleans and numeric strings are not accepted. Cumulative totals come from the latest valid record. Transfer-time estimates use total bytes divided by total duration for the same device's latest five valid transfers. Transfers to other devices are excluded; if no valid transfers match, legacy cumulative records without a destination provide a fallback. With no usable history, the estimate is shown as unknown.
+
+If `transfer_history.jsonl` is absent, an existing `.move_history.jsonl` is automatically renamed when history is first read or written. Existing records and cumulative statistics are preserved; missing metadata in old records is not reconstructed. If both files exist, the app uses `transfer_history.jsonl` and leaves the old file untouched.
+
+## Commands and controls
+
+Submit `URL [trim seconds] [nomove]` in the TUI:
 
 ```text
 https://example.com/episode
 https://example.com/episode 10
 https://example.com/episode nomove
-https://example.com/episode 10 nomove
+https://example.com/episode 0.5 nomove
 https://example.com/episode nomove 10
 ```
 
-- 数字表示裁掉开头的秒数，支持小数。
-- 默认同时处理 3 个任务；每个任务内部依次获取页面、下载、转换或裁剪。
-- 默认复制当前任务的 MP3 和标题 TXT 到设备，保留本地文件；显式指定 `nomove` 时只生成本地文件，不传输到设备。
-- 设备任务按音频处理完成、进入队列的顺序执行，一次一个；每次复制后更新设备的 `LIST.md`。
-- 设备未挂载时等待设备，其他下载和转换继续执行。
-- 顶部固定的「设备传输」区显示正在复制／等待设备的任务，以及实际顺序的排队列表；复制时显示进度、速度和预计剩余时间。排队列表超过三行可独立滚动。
-- 任务表随窗口宽度分配标题和详情列，窄窗口支持横向滚动，编号和状态固定在左侧；选中任务的标题、URL、状态、裁剪秒数、耗时、传输方式、输出文件、目标设备及复制进度显示在表格下方，可独立滚动查看；切换任务时回到详情顶部。
-- 界面标签、状态、输入提示和应用日志使用英文；播客标题保留原文。
-- 输入框与下方的一行总体状态固定在底部；状态显示处理、等待、完成、失败、复制排队和设备连接情况。
-- ↑ / ↓ 回看输入历史；任务表和日志可滚动，Tab 切换焦点。
-- `/exit` 停止接收任务，完成所有已提交任务后退出。设备未连接时会继续等待。
-- Ctrl+C 停止下载和转换，等待当前复制操作清理临时文件后退出。已生成的本地结果保留。
-- 单个任务失败不影响其他任务，错误显示在任务表和日志。
+These URLs illustrate the syntax; use a supported episode page when running the app.
 
-配置位于 `pod.py` 顶部：`DEST` 是目标设备，`MAX_CONCURRENT` 是处理并发数。
-`dist/`、`tmp/` 和 `.move_history.jsonl` 均位于脚本目录，不受启动位置影响。
-文件名使用 `月日_时分秒_毫秒`；同一毫秒提交多个任务时递增毫秒，避免覆盖。
-程序不扫描或搬走 `dist/` 内其他任务或以前留下的文件。
+- A non-negative number trims that many seconds from the beginning. Decimals require a leading digit, for example `0.5`.
+- Omitting `nomove` copies the task's MP3 and title TXT to the configured device and keeps the local files.
+- Up / Down recalls input history while the input has focus. Tab switches focus.
+- `/exit` stops accepting tasks and exits after submitted tasks finish. It keeps waiting if a required device is disconnected.
+- Ctrl+C (or Ctrl+Q) stops downloads and conversions, waits for the active copy to clean up its temporary file, and exits. Local results and device files already finalized are kept.
 
-验证：
+## Processing and output
+
+Within each task, page fetch, download, and conversion or trimming run in sequence. By default, up to three tasks process concurrently. A failed task does not stop the others.
+
+Page fetching and audio downloading each allow up to three attempts for temporary network failures, including connection failures, timeouts, interrupted transfers, and HTTP 408, 429, 500, 502, 503 and 504. Retry waits are one second and then two seconds, with the next attempt shown in the task details and log. Audio retries restart the download from the beginning. Other HTTP errors, missing `og:audio`, and conversion errors fail without automatic retry. Ctrl+C also cancels a request or retry wait.
+
+During audio downloading, the task table and selected task details show the attempt number, downloaded size and average speed for the current attempt. When the server supplies a usable `Content-Length`, they also show total size, percentage and estimated remaining time. Otherwise they show `Total unknown` without a percentage or ETA.
+
+The output is an MP3 plus a UTF-8 TXT file containing the page title:
+
+- An MP3 with no trim request is copied unchanged unless `ffprobe` reports an audio bitrate above 128 kbps. If no numeric bitrate is reported, it is also copied unchanged.
+- Other inputs, higher-bitrate MP3s, and all trim requests are re-encoded using FFmpeg's `libmp3lame` encoder with `-q:a 7`. This is variable-quality encoding, not a fixed output bitrate; trimming is not lossless.
+- Specifying `0` seconds still re-encodes the audio. Omit the trim argument to allow eligible MP3 files to be kept unchanged.
+- Names use `monthday_hourminsec_millisecond`. The app checks existing output names and increments the timestamp to avoid collisions within its task submission flow. Multiple app instances sharing an output directory or device are not supported.
+- The app processes only files produced for the submitted task; it does not scan or transfer old files in `dist/`.
+
+Device tasks run in the order their audio finishes processing and enters the transfer queue, one at a time. Each copied file is written through a temporary `.part` file. The MP3/TXT pair is not one atomic transaction: an interruption after the MP3 is finalized may leave only that file on the device. Local results are retained if a transfer fails.
+
+After each successful pair is copied, the app updates transfer history and regenerates the device's `LIST.md` from all top-level `.txt` files on the device. An existing `LIST.md` is replaced. Each title line contributes the text before its first `|`.
+
+The pinned Device Transfer section shows the active transfer or device wait, copy progress, speed, estimated remaining time, and queue order. The task table adapts to terminal width; narrow terminals scroll horizontally with ID and status fixed. The selected task's details and long queue lists scroll independently. The bottom status line shows task counts and device connection. UI labels and logs are in English; podcast titles retain their original text.
+
+## Troubleshooting
+
+- **No device configured:** use `nomove`, or set `dest` in `config.json` and restart.
+- **Waiting for device:** check the actual mount point. `/exit` will wait; Ctrl+C stops the session.
+- **Missing commands:** install the required system tools and ensure they are on PATH.
+- **No og:audio found:** the page does not expose audio in the supported HTML format.
+- **Download or conversion failed:** review the task details and log. Completed local results are kept if only the device transfer fails.
+- **Retrying failed tasks:** temporary network errors are retried within the current task as described above. Once a task is marked as failed, it is not retried automatically. The app waits for a disconnected device before starting a copy, but a copy that fails after starting is marked as failed and does not resume when the device reconnects. After a transfer failure, reconnect the device and manually copy the retained MP3/TXT files, or submit the episode again to create a new task. For a download or conversion failure, submit the episode again after resolving the cause.
+
+## Tests
+
+With the virtual environment activated and the system dependencies installed:
 
 ```sh
-./.venv/bin/python -m unittest -v test_pod.py
+python -m unittest -v test_pod.py
 ```
+
+Tests use temporary directories, a local HTTP server, generated audio, and mocked device mounting. They cover task parsing, configuration, TUI layout, processing concurrency, transfer ordering, history migration and malformed records, per-device speed estimates, download progress with known and unknown sizes, transient HTTP errors and interrupted-download retries, real local download/conversion/trimming, and cancellation cleanup during requests and retry waits. They do not contact podcast websites or write to a real audio device.
+
+GitHub Actions runs this suite on macOS with Python 3.10 and 3.14.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

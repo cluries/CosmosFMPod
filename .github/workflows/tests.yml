@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install system dependencies
+        run: brew install ffmpeg
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run tests
+        run: python -m unittest -v test_pod.py
