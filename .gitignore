@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+
+# 运行时生成的产物
+dist/
+tmp/
+.move_history.jsonl
+
+# 备份的旧脚本
+bak/
+
+# 编辑器 / 系统文件
+.vscode/
+.DS_Store
